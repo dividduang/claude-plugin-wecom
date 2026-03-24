@@ -1,0 +1,14 @@
+{
+  "name": "wecom",
+  "version": "0.1.0",
+  "description": "WeChat Work (企业微信) channel for Claude Code",
+  "main": "server.ts",
+  "channel": {
+    "name": "wecom",
+    "capabilities": ["claude/channel", "claude/channel/permission"]
+  },
+  "skills": [
+    "skills/wecom/configure.md",
+    "skills/wecom/access.md"
+  ]
+}

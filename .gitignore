@@ -1,0 +1,4 @@
+node_modules/
+.omc/
+bun.lock
+package-lock.json
