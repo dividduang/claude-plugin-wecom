@@ -10,8 +10,8 @@ Chat with Claude Code from WeChat Work — text, images, files, voice, video, wi
 **Install / 安装：**
 
 ```bash
-claude plugin marketplace add <your-repo>/claude-plugin-wecom
-claude plugin install wecom
+claude plugin marketplace add dividduang/claude-plugin-wecom
+claude plugin install wecom@claude-plugins
 ```
 
 **Start / 启动：**
