@@ -1,0 +1,21 @@
+{
+  "name": "dividduang-plugins",
+  "owner": {
+    "name": "dividduang"
+  },
+  "metadata": {
+    "description": "Claude Code plugins by dividduang"
+  },
+  "plugins": [
+    {
+      "name": "wecom",
+      "source": "./",
+      "description": "WeChat Work (企业微信) channel for Claude Code — messaging bridge via WeCom intelligent robot API with built-in access control.",
+      "version": "0.1.0",
+      "author": {
+        "name": "dividduang"
+      },
+      "keywords": ["wecom", "weixin", "enterprise-wechat", "messaging", "channel", "mcp"]
+    }
+  ]
+}
