@@ -25,7 +25,7 @@ import { homedir } from 'os'
 import { join, sep } from 'path'
 import { randomBytes } from 'crypto'
 import { z } from 'zod'
-import { WSClient, generateReqId, type WsFrame, type TextMessage, type ImageMessage, type MixedMessage, type VoiceMessage, type FileMessage, type VideoMessage } from 'aibot-node-sdk'
+import { WSClient, generateReqId, type WsFrame, type TextMessage, type ImageMessage, type MixedMessage, type VoiceMessage, type FileMessage, type VideoMessage } from '@wecom/aibot-node-sdk'
 
 // State directory
 const STATE_DIR = join(homedir(), '.claude', 'channels', 'wecom')

@@ -4,7 +4,7 @@
  * 不依赖 MCP 协议，直接测试 SDK 连接
  */
 
-import { WSClient } from 'aibot-node-sdk'
+import { WSClient } from '@wecom/aibot-node-sdk'
 import { readFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'

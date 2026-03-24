@@ -52,12 +52,17 @@ bun --version      # required
 ### Step 1 — Install dependencies
 
 ```bash
-cd "$PLUGIN_ROOT" && bun install --no-summary
+cd "$PLUGIN_ROOT" && npm install
+# or with bun: bun install
 ```
+
+> Note: Dependencies include `@wecom/aibot-node-sdk` from npm, no local path required.
 
 ### Step 2 — Configure credentials
 
 Run `/wecom:configure set <botId> <secret>` with credentials from WeCom admin console.
+
+Credentials are stored in `~/.claude/channels/wecom/credentials.json`.
 
 ### Step 3 — Restart with channel
 
@@ -70,6 +75,38 @@ claude --dangerously-skip-permissions --dangerously-load-development-channels pl
 1. Send message from WeCom
 2. Receive pairing code
 3. Run `/wecom:access pair <code>`
+
+---
+
+## Local Development / 本地开发
+
+### Install dependencies
+
+```bash
+cd D:\rpa\202603\claude-plugin-wecom
+npm install
+```
+
+### Test connection
+
+```bash
+bun test-connection.ts
+```
+
+This will connect to WeCom and listen for messages. Useful for debugging.
+
+### Send message proactively
+
+```bash
+bun send-message.ts <userid> "<message>"
+```
+
+Example:
+```bash
+bun send-message.ts 15577726720 "Hello from Claude!"
+```
+
+This allows sending messages to WeCom without needing an inbound message first.
 
 ---
 
@@ -86,6 +123,40 @@ claude --dangerously-skip-permissions --dangerously-load-development-channels pl
 |-------|---------|
 | `/wecom:configure` | Configure bot credentials |
 | `/wecom:access` | Manage user access control |
+
+---
+
+## Troubleshooting / 故障排除
+
+### bun install fails with EPERM
+
+On Windows, bun may have permission issues. Use npm instead:
+```bash
+npm install
+```
+
+### Module not found: aibot-node-sdk
+
+Make sure package.json uses `@wecom/aibot-node-sdk` (not local path):
+```json
+"@wecom/aibot-node-sdk": "^1.0.4"
+```
+
+---
+
+## Project Structure / 项目结构
+
+```
+claude-plugin-wecom/
+├── server.ts           # MCP server (main entry)
+├── test-connection.ts  # Connection test script
+├── send-message.ts     # Proactive message sender
+├── package.json
+├── README.md
+└── skills/
+    ├── configure/      # /wecom:configure skill
+    └── access/         # /wecom:access skill
+```
 
 ---
 

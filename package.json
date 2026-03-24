@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "aibot-node-sdk": "file:../aibot-node-sdk",
+    "@wecom/aibot-node-sdk": "^1.0.4",
     "zod": "^3.23.0"
   }
 }
