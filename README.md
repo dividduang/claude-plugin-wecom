@@ -11,8 +11,12 @@ Chat with Claude Code from WeChat Work — text, images, files, voice, video, wi
 
 ```bash
 claude plugin marketplace add dividduang/claude-plugin-wecom
-claude plugin install wecom@claude-plugins
+claude plugin install wecom@dividduang-plugins
 ```
+
+**Acknowledgments / 致谢**
+
+This project is based on [claude-plugin-wechat](https://github.com/lc2panda/claude-plugin-wechat) by [@lc2panda](https://github.com/lc2panda).
 
 **Start / 启动：**
 
