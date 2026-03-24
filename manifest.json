@@ -8,7 +8,7 @@
     "capabilities": ["claude/channel", "claude/channel/permission"]
   },
   "skills": [
-    "skills/wecom/configure.md",
-    "skills/wecom/access.md"
+    "skills/configure/SKILL.md",
+    "skills/access/SKILL.md"
   ]
 }
