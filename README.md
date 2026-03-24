@@ -21,7 +21,7 @@ This project is based on [claude-plugin-wechat](https://github.com/lc2panda/clau
 **Start / 启动：**
 
 ```bash
-claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:wecom
+claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:wecom@dividduang-plugins
 ```
 
 **Setup / 配置：**
@@ -62,7 +62,7 @@ Run `/wecom:configure set <botId> <secret>` with credentials from WeCom admin co
 ### Step 3 — Restart with channel
 
 ```bash
-claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:wecom
+claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:wecom@dividduang-plugins
 ```
 
 ### Step 4 — Pair user
