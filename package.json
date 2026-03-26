@@ -1,13 +1,25 @@
 {
   "name": "claude-channel-wecom",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "description": "WeCom (企业微信) channel for Claude Code — text, images, files, voice, video, remote permission relay",
   "license": "MIT",
   "type": "module",
-  "bin": "./server.ts",
+  "bin": {
+    "wecom-channel": "./server.ts",
+    "wecom-acp": "./acp-bridge.ts"
+  },
   "scripts": {
-    "start": "bun install --no-summary && bun server.ts"
+    "start": "bun install --no-summary && bun server.ts",
+    "start:acp": "bun install --no-summary && bun acp-bridge.ts",
+    "test:connection": "bun install --no-summary && bun test-connection.ts"
+  },
+  "keywords": ["wecom", "weixin", "enterprise-wechat", "claude", "claude-code", "mcp", "acp", "chatbot", "ai"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dividduang/claude-plugin-wecom.git"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^0.16.1",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@wecom/aibot-node-sdk": "^1.0.4",
     "zod": "^3.23.0"
