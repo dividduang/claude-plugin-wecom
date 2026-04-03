@@ -43,6 +43,35 @@ claude plugin install wecom@dividduang-plugins
 1. 在企业微信管理后台创建智能机器人，获取 `botId` 和 `secret`
 2. 在 Claude Code 终端中输入 `/wecom:configure set <botId> <secret>`
 
+<details>
+<summary><b>多机器人配置（可选）</b></summary>
+
+支持同时配置多个企业微信机器人，每个机器人独立接收消息：
+
+```bash
+# 添加命名机器人
+/wecom:configure set 客服机器人 <botId1> <secret1>
+/wecom:configure set 技术支持 <botId2> <secret2>
+
+# 查看已配置的机器人
+/wecom:configure list
+
+# 移除某个机器人
+/wecom:configure remove 技术支持
+```
+
+多机器人凭证文件格式：
+```json
+{
+  "bots": [
+    { "name": "客服机器人", "botId": "xxx", "secret": "xxx" },
+    { "name": "技术支持", "botId": "yyy", "secret": "yyy" }
+  ]
+}
+```
+
+</details>
+
 #### 第 3 步 · 启动
 
 退出 Claude Code，用以下命令重新启动：
@@ -336,13 +365,13 @@ Users can switch working directory from WeCom by sending `/cwd /new/path`. This 
 
 | Tool | Purpose | Params |
 |------|---------|--------|
-| `reply` | Send text/files to WeCom | `user_id`, `text`; optional `files[]` |
+| `reply` | Send text/files to WeCom | `user_id`, `bot_name`, `text`; optional `files[]` |
 | `download_attachment` | Download media from WeCom | `attachment_id` |
 
 ### Channel protocol
 
 - Capabilities: `claude/channel` + `claude/channel/permission`
-- Inbound: `notifications/claude/channel` → meta `{user_id, ts}`
+- Inbound: `notifications/claude/channel` → meta `{user_id, bot_name, ts}`
 - Outbound: `reply` tool.
 - Permission relay: user replies `yes <code>` / `no <code>` from WeCom
 - Media: images, files, voice, video via WeCom intelligent robot API
@@ -356,6 +385,7 @@ Users can switch working directory from WeCom by sending `/cwd /new/path`. This 
 - Supports any ACP-compatible agent: Claude Code, Copilot, Gemini, Codex, Qwen, OpenCode
 - Same media pipeline as Channel mode (inline download)
 - Per-user working directory via `/cwd` command (persisted in `user-cwd.json`)
+- **Multi-bot support**: each bot+user pair gets an independent agent session (one bot = one Claude Code CLI)
 
 ### WeCom commands (both modes)
 
@@ -382,6 +412,8 @@ Users can switch working directory from WeCom by sending `/cwd /new/path`. This 
 | Streaming | yes | yes (agent_message_chunk) |
 | Multi-agent | Claude Code only | Any ACP agent (Claude/Copilot/Gemini/Codex) |
 | Multi-turn | yes | yes (persistent session) |
+| Multi-bot | yes (shared Claude) | yes (independent agent per bot+user) |
+| Multi-bot | yes (shared Claude) | yes (independent agent per bot+user) |
 | Media | yes | yes |
 | Working dir switch | N/A (bound to session) | `/cwd` command from WeCom |
 | Global install | Plugin marketplace | `bun add -g` / `bunx` |
@@ -390,7 +422,7 @@ Users can switch working directory from WeCom by sending `/cwd /new/path`. This 
 
 | File | Content |
 |------|---------|
-| `credentials.json` | Bot auth (botId, secret) |
+| `credentials.json` | Bot auth — single (`{botId, secret}`) or multi-bot (`{bots: [{name, botId, secret}]}`) |
 | `access.json` | Access control |
 | `context-tokens.json` | Per-user context info |
 | `user-cwd.json` | Per-user working directory (ACP) |

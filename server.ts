@@ -4,6 +4,7 @@
  *
  * MCP server bridging Claude Code and WeCom intelligent robots via WebSocket.
  * Uses aibot-node-sdk for WeCom protocol handling.
+ * Supports multi-bot (multi-account) configuration.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -16,16 +17,15 @@ import {
   readFileSync,
   writeFileSync,
   mkdirSync,
-  readdirSync,
   rmSync,
-  realpathSync,
   renameSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join, sep } from 'path'
+import { join } from 'path'
 import { randomBytes } from 'crypto'
 import { z } from 'zod'
-import { WSClient, generateReqId, type WsFrame, type TextMessage, type ImageMessage, type MixedMessage, type VoiceMessage, type FileMessage, type VideoMessage } from '@wecom/aibot-node-sdk'
+import { generateReqId, type WsFrame } from '@wecom/aibot-node-sdk'
+import { BotManager, type MultiCredentials } from './bot-manager'
 
 // State directory
 const STATE_DIR = join(homedir(), '.claude', 'channels', 'wecom')
@@ -35,11 +35,6 @@ const CONTEXT_TOKENS_FILE = join(STATE_DIR, 'context-tokens.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 
 // --- Types ---
-
-type Credentials = {
-  botId: string
-  secret: string
-}
 
 type PendingEntry = {
   senderId: string
@@ -60,9 +55,15 @@ function defaultAccess(): Access {
   return { dmPolicy: 'pairing', allowFrom: [], pending: {} }
 }
 
+// --- Composite key for per-bot-per-user context isolation ---
+
+function sessionKey(botName: string, userId: string): string {
+  return `${botName}:${userId}`
+}
+
 // --- State persistence ---
 
-function loadCredentials(): Credentials | null {
+function loadCredentials(): MultiCredentials | null {
   try {
     return JSON.parse(readFileSync(CREDENTIALS_FILE, 'utf8'))
   } catch {
@@ -96,8 +97,8 @@ function saveAccess(a: Access): void {
 
 // --- Context token management ---
 
-// Map userid -> context info (for replies)
-const contextMap = new Map<string, { frame: WsFrame; ts: number }>()
+// Map sessionKey → context info (for replies)
+const contextMap = new Map<string, { frame: WsFrame; ts: number; botName: string; userId: string }>()
 
 function persistContextTokens(): void {
   try {
@@ -221,9 +222,9 @@ function gate(senderId: string): GateResult {
 
 // --- Message extraction ---
 
-const pendingAttachments = new Map<string, { url: string; aeskey?: string; filename: string }>()
+const pendingAttachments = new Map<string, { url: string; aeskey?: string; filename: string; botName: string }>()
 
-function extractMessageContent(frame: WsFrame): string {
+function extractMessageContent(frame: WsFrame, botName: string): string {
   const body = frame.body as any
   const msgtype = body.msgtype
   const parts: string[] = []
@@ -235,7 +236,7 @@ function extractMessageContent(frame: WsFrame): string {
     const aeskey = body.image?.aeskey
     if (url) {
       const id = `img_${Date.now()}_${randomBytes(3).toString('hex')}`
-      pendingAttachments.set(id, { url, aeskey, filename: 'image.jpg' })
+      pendingAttachments.set(id, { url, aeskey, filename: 'image.jpg', botName })
       parts.push(`(image: attachment_id=${id})`)
     } else {
       parts.push('(image)')
@@ -252,7 +253,7 @@ function extractMessageContent(frame: WsFrame): string {
     const filename = body.file?.name || 'file'
     if (url) {
       const id = `file_${Date.now()}_${randomBytes(3).toString('hex')}`
-      pendingAttachments.set(id, { url, aeskey, filename })
+      pendingAttachments.set(id, { url, aeskey, filename, botName })
       parts.push(`(file: ${filename}, attachment_id=${id})`)
     } else {
       parts.push(`(file: ${filename})`)
@@ -262,7 +263,7 @@ function extractMessageContent(frame: WsFrame): string {
     const aeskey = body.video?.aeskey
     if (url) {
       const id = `video_${Date.now()}_${randomBytes(3).toString('hex')}`
-      pendingAttachments.set(id, { url, aeskey, filename: 'video.mp4' })
+      pendingAttachments.set(id, { url, aeskey, filename: 'video.mp4', botName })
       parts.push(`(video: attachment_id=${id})`)
     } else {
       parts.push('(video)')
@@ -276,14 +277,13 @@ function extractMessageContent(frame: WsFrame): string {
         const aeskey = item.image?.aeskey
         if (url) {
           const id = `img_${Date.now()}_${randomBytes(3).toString('hex')}`
-          pendingAttachments.set(id, { url, aeskey, filename: 'image.jpg' })
+          pendingAttachments.set(id, { url, aeskey, filename: 'image.jpg', botName })
           parts.push(`(image: attachment_id=${id})`)
         }
       }
     }
   }
 
-  // Handle quoted/referenced message
   if (body.quote?.text?.content) {
     parts.push(`[引用: ${body.quote.text.content}]`)
   }
@@ -291,11 +291,11 @@ function extractMessageContent(frame: WsFrame): string {
   return parts.join('\n') || '(empty message)'
 }
 
-// --- MCP Server ---
+// --- Initialize BotManager ---
 
-const creds = loadCredentials()
+const rawCreds = loadCredentials()
 
-if (!creds?.botId || !creds?.secret) {
+if (!rawCreds) {
   process.stderr.write(
     `wecom channel: credentials required\n` +
     `  run /wecom:configure set <botId> <secret> in Claude Code\n`,
@@ -303,11 +303,20 @@ if (!creds?.botId || !creds?.secret) {
   process.exit(1)
 }
 
-// Initialize WSClient
-const wsClient = new WSClient({
-  botId: creds.botId,
-  secret: creds.secret,
-})
+const botManager = new BotManager()
+botManager.loadCredentials(rawCreds)
+
+if (botManager.botCount === 0) {
+  process.stderr.write(
+    `wecom channel: no valid bot credentials found\n` +
+    `  run /wecom:configure set <botId> <secret> in Claude Code\n`,
+  )
+  process.exit(1)
+}
+
+process.stderr.write(`wecom channel: ${botManager.botCount} bot(s) configured: ${botManager.botNames.join(', ')}\n`)
+
+// --- MCP Server ---
 
 const mcp = new Server(
   { name: 'wecom', version: '1.0.0' },
@@ -322,7 +331,9 @@ const mcp = new Server(
     instructions: [
       'The sender reads WeChat Work (企业微信), not this session. Anything you want them to see must go through the reply tool.',
       '',
-      'Messages from WeCom arrive as <channel source="wecom" user_id="..." ts="...">. Reply with the reply tool.',
+      'Messages from WeCom arrive as <channel source="wecom" user_id="..." bot_name="..." ts="...">. Reply with the reply tool, passing bot_name from the inbound message.',
+      '',
+      'Each bot has independent context. Use the bot_name from the message to route replies correctly.',
       '',
       'Media messages (images, files, video) arrive with attachment_id in the text. Use download_attachment tool to download them.',
       '',
@@ -339,11 +350,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
-      description: 'Reply on WeCom. Pass user_id from inbound message.',
+      description: 'Reply on WeCom. Pass user_id and bot_name from the inbound message to route through the correct bot.',
       inputSchema: {
         type: 'object',
         properties: {
           user_id: { type: 'string', description: 'The userid from the inbound message.' },
+          bot_name: { type: 'string', description: 'The bot_name from the inbound message. Routes reply through the correct bot.' },
           text: { type: 'string', description: 'Message text (Markdown supported).' },
           files: {
             type: 'array',
@@ -351,7 +363,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: 'Optional list of local file paths to send as attachments.',
           },
         },
-        required: ['user_id', 'text'],
+        required: ['user_id', 'bot_name', 'text'],
       },
     },
     {
@@ -380,14 +392,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply': {
         const userId = args.user_id as string
+        const botName = args.bot_name as string
         const text = args.text as string
 
         if (!userId) throw new Error('user_id is required')
 
-        // Get stored frame for this user
-        const ctx = contextMap.get(userId)
+        // Look up context by botName+userId, or fall back to searching by userId only
+        let ctx = botName ? contextMap.get(sessionKey(botName, userId)) : undefined
+        if (!ctx) {
+          // Fallback: find the latest context for this user across all bots
+          for (const [key, entry] of contextMap) {
+            if (entry.userId === userId && (!ctx || entry.ts > ctx.ts)) {
+              ctx = entry
+            }
+          }
+        }
         if (!ctx) {
           throw new Error(`No context for user ${userId}. Wait for an inbound message first.`)
+        }
+
+        const wsClient = botManager.getBot(ctx.botName)
+        if (!wsClient) {
+          throw new Error(`Bot "${ctx.botName}" not found. It may have disconnected.`)
         }
 
         // Check access
@@ -453,6 +479,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const info = pendingAttachments.get(attachmentId)
         if (!info) throw new Error(`attachment ${attachmentId} not found or already downloaded`)
 
+        const wsClient = botManager.getBot(info.botName)
+        if (!wsClient) throw new Error(`Bot "${info.botName}" not found for download`)
+
         mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
 
         const { buffer, filename } = await wsClient.downloadFile(info.url, info.aeskey)
@@ -494,95 +523,111 @@ const PermissionRequestSchema = z.object({
 
 mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   const access = loadAccess()
-  for (const userId of access.allowFrom) {
-    const ctx = contextMap.get(userId)
-    if (!ctx) continue
+  // Relay to each user via the bot they last used
+  for (const [key, ctx] of contextMap) {
+    if (!access.allowFrom.includes(ctx.userId)) continue
+    const wsClient = botManager.getBot(ctx.botName)
+    if (!wsClient) {
+      process.stderr.write(`wecom channel: permission relay skipped — bot "${ctx.botName}" not available for ${ctx.userId}\n`)
+      continue
+    }
     try {
       const streamId = generateReqId('stream')
       const msg = `🔐 Claude 请求权限：${params.tool_name}\n${params.description}\n\n回复 "yes ${params.request_id}" 批准\n回复 "no ${params.request_id}" 拒绝`
       await wsClient.replyStream(ctx.frame, streamId, msg, true)
     } catch (err) {
-      process.stderr.write(`wecom channel: permission relay failed for ${userId}: ${err}\n`)
+      process.stderr.write(`wecom channel: permission relay failed for ${ctx.userId}: ${err}\n`)
     }
   }
 })
 
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
-// --- WebSocket event handlers ---
+// --- Per-bot message handlers ---
 
-wsClient.on('authenticated', () => {
-  process.stderr.write('wecom channel: WebSocket authenticated\n')
-})
+for (const botName of botManager.botNames) {
+  botManager.on(`${botName}.authenticated`, () => {
+    process.stderr.write(`wecom channel: bot "${botName}" authenticated\n`)
+  })
 
-wsClient.on('disconnected', (reason) => {
-  process.stderr.write(`wecom channel: disconnected (${reason})\n`)
-})
+  botManager.on(`${botName}.disconnected`, (reason: string) => {
+    process.stderr.write(`wecom channel: bot "${botName}" disconnected (${reason})\n`)
+  })
 
-wsClient.on('error', (error) => {
-  process.stderr.write(`wecom channel: error - ${error.message}\n`)
-})
+  botManager.on(`${botName}.error`, (error: Error) => {
+    process.stderr.write(`wecom channel: bot "${botName}" error - ${error.message}\n`)
+  })
 
-// Handle all messages
-wsClient.on('message', (frame: WsFrame) => {
-  const body = frame.body as any
-  const userId = body.from?.userid
-  if (!userId) return
+  botManager.on(`${botName}.message`, (frame: WsFrame) => {
+    const body = frame.body as any
+    const userId = body.from?.userid
+    if (!userId) return
 
-  // Store frame for reply context
-  contextMap.set(userId, { frame, ts: Date.now() })
-  debouncedPersist()
+    const key = sessionKey(botName, userId)
 
-  const result = gate(userId)
+    // Store frame with botName for reply context
+    contextMap.set(key, { frame, ts: Date.now(), botName, userId })
+    debouncedPersist()
 
-  if (result.action === 'drop') return
+    const result = gate(userId)
 
-  if (result.action === 'pair') {
-    const streamId = generateReqId('stream')
-    const lead = result.isResend ? '仍在等待配对' : '需要配对验证'
-    wsClient.replyStream(frame, streamId, `${lead} — 在 Claude Code 终端运行：\n\n/wecom:access pair ${result.code}`, true).catch(() => {})
-    return
-  }
+    if (result.action === 'drop') return
 
-  // Check for permission reply
-  if (body.msgtype === 'text' && body.text?.content) {
-    const match = PERMISSION_REPLY_RE.exec(body.text.content.trim())
-    if (match) {
-      void mcp.notification({
-        method: 'notifications/claude/channel/permission',
-        params: {
-          request_id: match[2].toLowerCase(),
-          behavior: match[1].toLowerCase().startsWith('y') ? 'allow' : 'deny',
-        },
-      })
-      const streamId = generateReqId('stream')
-      wsClient.replyStream(frame, streamId, `已${match[1].toLowerCase().startsWith('y') ? '批准' : '拒绝'}权限请求`, true).catch(() => {})
+    if (result.action === 'pair') {
+      const wsClient = botManager.getBot(botName)
+      if (wsClient) {
+        const streamId = generateReqId('stream')
+        const lead = result.isResend ? '仍在等待配对' : '需要配对验证'
+        wsClient.replyStream(frame, streamId, `${lead} — 在 Claude Code 终端运行：\n\n/wecom:access pair ${result.code}`, true).catch(() => {})
+      }
       return
     }
-  }
 
-  // Extract and forward message
-  const content = extractMessageContent(frame)
-  const ts = body.create_time ? new Date(body.create_time * 1000).toISOString() : new Date().toISOString()
+    // Check for permission reply
+    if (body.msgtype === 'text' && body.text?.content) {
+      const match = PERMISSION_REPLY_RE.exec(body.text.content.trim())
+      if (match) {
+        void mcp.notification({
+          method: 'notifications/claude/channel/permission',
+          params: {
+            request_id: match[2].toLowerCase(),
+            behavior: match[1].toLowerCase().startsWith('y') ? 'allow' : 'deny',
+          },
+        })
+        const wsClient = botManager.getBot(botName)
+        if (wsClient) {
+          const streamId = generateReqId('stream')
+          wsClient.replyStream(frame, streamId, `已${match[1].toLowerCase().startsWith('y') ? '批准' : '拒绝'}权限请求`, true).catch(() => {})
+        }
+        return
+      }
+    }
 
-  void mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content,
-      meta: {
-        user_id: userId,
-        ts,
+    // Extract and forward message
+    const content = extractMessageContent(frame, botName)
+    const ts = body.create_time ? new Date(body.create_time * 1000).toISOString() : new Date().toISOString()
+
+    void mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content,
+        meta: {
+          user_id: userId,
+          bot_name: botName,
+          ts,
+        },
       },
-    },
+    })
   })
-})
+}
 
 // --- Connect and start ---
 
 await mcp.connect(new StdioServerTransport())
 
-process.stderr.write('wecom channel: connecting to WeCom...\n')
-wsClient.connect()
+process.stderr.write('wecom channel: connecting all bots to WeCom...\n')
+botManager.connectAll()
+botManager.printStatus()
 
 // --- Graceful shutdown ---
 
@@ -599,7 +644,7 @@ function shutdown(reason: string): void {
   }, 2000)
   forceTimer.unref()
 
-  wsClient.disconnect()
+  botManager.disconnectAll()
   mcp.close().catch(() => {}).finally(() => {
     clearTimeout(forceTimer)
     process.exit(0)
@@ -614,6 +659,6 @@ process.on('unhandledRejection', (err) => {
   process.stderr.write(`wecom channel: unhandled rejection: ${err}\n`)
 })
 process.on('uncaughtException', (err) => {
-  process.stderr.write(`wecom channel: uncaught exception: ${err}\n`)
+  process.stderr.write(`wecom channel: unhandled exception: ${err}\n`)
   shutdown('uncaughtException')
 })

@@ -5,22 +5,24 @@
  * Pos: ACP bridge — connects WeCom to any ACP-compatible AI agent (Claude Code, Copilot, Gemini, Codex, etc.)
  *
  * Uses Agent Client Protocol (ACP) for persistent agent sessions.
- * Each WeCom user gets a dedicated agent subprocess with session continuity.
+ * Each bot+user pair gets a dedicated agent subprocess with session continuity.
+ * Supports multi-bot (multi-account) configuration — each bot has independent sessions.
  * State lives in ~/.claude/channels/wecom/
  */
 
-import { randomBytes, createCipheriv, createDecipheriv } from 'crypto'
+import { randomBytes } from 'crypto'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
-  statSync, renameSync, realpathSync,
+  statSync, renameSync,
 } from 'fs'
 import fs from 'node:fs'
 import { homedir } from 'os'
-import { join, sep } from 'path'
+import { join } from 'path'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { Writable, Readable } from 'node:stream'
 import * as acp from '@agentclientprotocol/sdk'
-import { WSClient, generateReqId, type WsFrame, type TextMessage, type ImageMessage, type MixedMessage, type VoiceMessage, type FileMessage, type VideoMessage } from '@wecom/aibot-node-sdk'
+import { generateReqId, type WsFrame } from '@wecom/aibot-node-sdk'
+import { BotManager, type MultiCredentials } from './bot-manager'
 
 // --- State directories ---
 
@@ -35,8 +37,6 @@ const DEBUG_MODE_FILE = join(STATE_DIR, 'debug-mode.json')
 
 // --- ACP Agent configuration ---
 
-// Built-in agent presets (matching wechat-acp convention)
-// Claude Code CLI does NOT natively speak ACP — it needs the @zed-industries/claude-code-acp wrapper.
 const AGENT_PRESETS: Record<string, { command: string; args: string[] }> = {
   claude:   { command: 'npx', args: ['@zed-industries/claude-code-acp'] },
   copilot:  { command: 'npx', args: ['@github/copilot', '--acp', '--yolo'] },
@@ -53,7 +53,6 @@ const AGENT_ARGS = process.env.ACP_AGENT_ARGS
   ? process.env.ACP_AGENT_ARGS.split(' ').filter(Boolean)
   : preset?.args ?? []
 
-// Parse CLI arguments
 const cliArgs = process.argv.slice(2)
 let defaultCwd = process.env.ACP_AGENT_CWD ?? process.cwd()
 for (let i = 0; i < cliArgs.length; i++) {
@@ -72,7 +71,7 @@ const AGENT_ENV: Record<string, string> = (() => {
   try { return JSON.parse(raw) } catch { return {} }
 })()
 const MAX_CONCURRENT_USERS = parseInt(process.env.ACP_MAX_USERS ?? '10', 10)
-const IDLE_TIMEOUT_MS = parseInt(process.env.ACP_IDLE_TIMEOUT ?? '86400000', 10) // 24h default
+const IDLE_TIMEOUT_MS = parseInt(process.env.ACP_IDLE_TIMEOUT ?? '86400000', 10)
 
 // --- Debug mode ---
 
@@ -87,14 +86,15 @@ function setDebugMode(enabled: boolean): void {
   renameSync(tmp, DEBUG_MODE_FILE)
 }
 
-// --- Load credentials ---
+// --- Composite key for per-bot-per-user session isolation ---
 
-type Credentials = {
-  botId: string
-  secret: string
+function sessionKey(botName: string, userId: string): string {
+  return `${botName}:${userId}`
 }
 
-function loadCredentials(): Credentials | null {
+// --- Load credentials & initialize BotManager ---
+
+function loadCredentials(): MultiCredentials | null {
   try {
     return JSON.parse(readFileSync(CREDENTIALS_FILE, 'utf8'))
   } catch {
@@ -102,15 +102,28 @@ function loadCredentials(): Credentials | null {
   }
 }
 
-const creds = loadCredentials()
+const rawCreds = loadCredentials()
 
-if (!creds?.botId || !creds?.secret) {
+if (!rawCreds) {
   process.stderr.write(
     `wecom acp-bridge: credentials required\n` +
     `  run /wecom:configure set <botId> <secret> in Claude Code\n`,
   )
   process.exit(1)
 }
+
+const botManager = new BotManager()
+botManager.loadCredentials(rawCreds)
+
+if (botManager.botCount === 0) {
+  process.stderr.write(
+    `wecom acp-bridge: no valid bot credentials found\n` +
+    `  run /wecom:configure set <botId> <secret> in Claude Code\n`,
+  )
+  process.exit(1)
+}
+
+process.stderr.write(`wecom acp-bridge: ${botManager.botCount} bot(s) configured: ${botManager.botNames.join(', ')}\n`)
 
 // --- Types ---
 
@@ -136,11 +149,10 @@ function defaultAccess(): Access {
 
 const MAX_CHUNK_LIMIT = 2000
 
-// Runtime set of allowed from_user_ids for outbound validation.
 const knownUsers = new Set<string>()
 
-// Map userid -> context info (for replies)
-const contextMap = new Map<string, { frame: WsFrame; ts: number }>()
+// Map sessionKey → context info (for replies)
+const contextMap = new Map<string, { frame: WsFrame; ts: number; botName: string; userId: string }>()
 
 function persistContextTokens(): void {
   try {
@@ -166,7 +178,7 @@ function debouncedPersist(): void {
   }, 5000)
 }
 
-// Per-user working directory overrides
+// Per-bot-per-user working directory overrides, keyed by sessionKey
 const userCwdMap = new Map<string, string>(
   (() => {
     try {
@@ -190,12 +202,12 @@ function persistUserCwd(): void {
   }
 }
 
-function getUserCwd(userId: string): string {
-  return userCwdMap.get(userId) ?? AGENT_CWD
+function getUserCwd(botName: string, userId: string): string {
+  return userCwdMap.get(sessionKey(botName, userId)) ?? AGENT_CWD
 }
 
-// Map attachment_id → download info for deferred media downloads
-const pendingAttachments = new Map<string, { url: string; aeskey?: string; filename: string }>()
+// Map attachment_id → download info (includes botName)
+const pendingAttachments = new Map<string, { url: string; aeskey?: string; filename: string; botName: string }>()
 
 // --- Access persistence ---
 
@@ -263,7 +275,6 @@ function gate(senderId: string): GateResult {
   if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
   if (access.dmPolicy === 'allowlist') return { action: 'drop' }
 
-  // pairing mode
   for (const code of Object.keys(access.pending)) {
     const p = access.pending[code]
     if (p.senderId === senderId) {
@@ -346,7 +357,7 @@ function chunk(text: string, limit: number): string[] {
 
 // --- Extract message content from WeCom frame ---
 
-function extractMessageContent(frame: WsFrame): string {
+function extractMessageContent(frame: WsFrame, botName: string): string {
   const body = frame.body as any
   const msgtype = body.msgtype
   const parts: string[] = []
@@ -358,7 +369,7 @@ function extractMessageContent(frame: WsFrame): string {
     const aeskey = body.image?.aeskey
     if (url) {
       const id = `img_${Date.now()}_${randomBytes(3).toString('hex')}`
-      pendingAttachments.set(id, { url, aeskey, filename: 'image.jpg' })
+      pendingAttachments.set(id, { url, aeskey, filename: 'image.jpg', botName })
       parts.push(`(image: attachment_id=${id})`)
     } else {
       parts.push('(image)')
@@ -375,7 +386,7 @@ function extractMessageContent(frame: WsFrame): string {
     const filename = body.file?.name || 'file'
     if (url) {
       const id = `file_${Date.now()}_${randomBytes(3).toString('hex')}`
-      pendingAttachments.set(id, { url, aeskey, filename })
+      pendingAttachments.set(id, { url, aeskey, filename, botName })
       parts.push(`(file: ${filename}, attachment_id=${id})`)
     } else {
       parts.push(`(file: ${filename})`)
@@ -385,7 +396,7 @@ function extractMessageContent(frame: WsFrame): string {
     const aeskey = body.video?.aeskey
     if (url) {
       const id = `video_${Date.now()}_${randomBytes(3).toString('hex')}`
-      pendingAttachments.set(id, { url, aeskey, filename: 'video.mp4' })
+      pendingAttachments.set(id, { url, aeskey, filename: 'video.mp4', botName })
       parts.push(`(video: attachment_id=${id})`)
     } else {
       parts.push('(video)')
@@ -399,14 +410,13 @@ function extractMessageContent(frame: WsFrame): string {
         const aeskey = item.image?.aeskey
         if (url) {
           const id = `img_${Date.now()}_${randomBytes(3).toString('hex')}`
-          pendingAttachments.set(id, { url, aeskey, filename: 'image.jpg' })
+          pendingAttachments.set(id, { url, aeskey, filename: 'image.jpg', botName })
           parts.push(`(image: attachment_id=${id})`)
         }
       }
     }
   }
 
-  // Handle quoted/referenced message
   if (body.quote?.text?.content) {
     parts.push(`[引用: ${body.quote.text.content}]`)
   }
@@ -416,17 +426,14 @@ function extractMessageContent(frame: WsFrame): string {
 
 // --- Inline media download ---
 
-async function downloadAttachment(attachmentId: string): Promise<string | null> {
+async function downloadAttachment(attachmentId: string, botName: string): Promise<string | null> {
   const info = pendingAttachments.get(attachmentId)
   if (!info) return null
 
-  mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+  const wsClient = botManager.getBot(botName)
+  if (!wsClient) return null
 
-  // Use WSClient's downloadFile method
-  const wsClient = new WSClient({
-    botId: creds!.botId,
-    secret: creds!.secret,
-  })
+  mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
 
   const { buffer, filename } = await wsClient.downloadFile(info.url, info.aeskey)
   const safeName = (filename || info.filename).replace(/[^a-zA-Z0-9._-]/g, '_')
@@ -560,15 +567,19 @@ class WeComAcpClient implements acp.Client {
 }
 
 // --- ACP session management ---
+// Keyed by sessionKey(botName, userId) — each bot+user pair gets an independent agent session.
 
 type UserSession = {
+  key: string
+  botName: string
   userId: string
   frame: WsFrame
   client: WeComAcpClient
   process: ChildProcess
   connection: acp.ClientSideConnection
   sessionId: string
-  queue: Array<{ prompt: acp.ContentBlock[]; frame: WsFrame }>
+  /** Queue entries carry their own botName for correct per-message routing. */
+  queue: Array<{ prompt: acp.ContentBlock[]; frame: WsFrame; botName: string }>
   processing: boolean
   lastActivity: number
 }
@@ -579,59 +590,50 @@ const userSessions = new Map<string, UserSession>()
 const cleanupTimer = setInterval(() => {
   if (IDLE_TIMEOUT_MS <= 0) return
   const now = Date.now()
-  for (const [userId, session] of userSessions) {
+  for (const [key, session] of userSessions) {
     if (now - session.lastActivity > IDLE_TIMEOUT_MS && !session.processing) {
-      process.stderr.write(`wecom acp-bridge: session for ${userId} idle for ${Math.round((now - session.lastActivity) / 60_000)}min, removing\n`)
+      process.stderr.write(`wecom acp-bridge: session for ${key} idle for ${Math.round((now - session.lastActivity) / 60_000)}min, removing\n`)
       if (!session.process.killed) session.process.kill('SIGTERM')
-      userSessions.delete(userId)
+      userSessions.delete(key)
     }
   }
 }, 2 * 60_000)
 cleanupTimer.unref()
 
 function evictOldestSession(): void {
-  let oldest: { userId: string; lastActivity: number } | null = null
-  for (const [uid, s] of userSessions) {
+  let oldest: { key: string; lastActivity: number } | null = null
+  for (const [key, s] of userSessions) {
     if (!s.processing && (!oldest || s.lastActivity < oldest.lastActivity)) {
-      oldest = { userId: uid, lastActivity: s.lastActivity }
+      oldest = { key, lastActivity: s.lastActivity }
     }
   }
   if (oldest) {
-    process.stderr.write(`wecom acp-bridge: evicting oldest idle session: ${oldest.userId}\n`)
-    const s = userSessions.get(oldest.userId)
+    process.stderr.write(`wecom acp-bridge: evicting oldest idle session: ${oldest.key}\n`)
+    const s = userSessions.get(oldest.key)
     if (s && !s.process.killed) s.process.kill('SIGTERM')
-    userSessions.delete(oldest.userId)
+    userSessions.delete(oldest.key)
   }
 }
 
-// Global WSClient for sending messages
-const wsClient = new WSClient({
-  botId: creds.botId,
-  secret: creds.secret,
-})
-
-async function createSession(userId: string, frame: WsFrame): Promise<UserSession> {
-  process.stderr.write(`wecom acp-bridge: creating session for ${userId}\n`)
+async function createSession(botName: string, userId: string, frame: WsFrame): Promise<UserSession> {
+  const key = sessionKey(botName, userId)
+  process.stderr.write(`wecom acp-bridge: creating session for ${key}\n`)
 
   const client = new WeComAcpClient({
-    sendTyping: () => {
-      // WeCom doesn't have a typing indicator API like WeChat
-      return Promise.resolve()
-    },
-    log: (msg) => process.stderr.write(`wecom acp-bridge [${userId}]: ${msg}\n`),
+    sendTyping: () => Promise.resolve(),
+    log: (msg) => process.stderr.write(`wecom acp-bridge [${key}]: ${msg}\n`),
   })
 
-  // Spawn agent subprocess
   const useShell = process.platform === 'win32'
   const proc = spawn(AGENT_COMMAND, AGENT_ARGS, {
     stdio: ['pipe', 'pipe', 'inherit'],
-    cwd: getUserCwd(userId),
+    cwd: getUserCwd(botName, userId),
     env: { ...process.env, ...AGENT_ENV },
     shell: useShell,
   })
 
   proc.on('error', (err) => {
-    process.stderr.write(`wecom acp-bridge [${userId}]: agent process error: ${String(err)}\n`)
+    process.stderr.write(`wecom acp-bridge [${key}]: agent process error: ${String(err)}\n`)
   })
 
   if (!proc.stdin || !proc.stdout) {
@@ -639,14 +641,12 @@ async function createSession(userId: string, frame: WsFrame): Promise<UserSessio
     throw new Error('Failed to get agent process stdio')
   }
 
-  // Set up ACP connection
   const input = Writable.toWeb(proc.stdin)
   const output = Readable.toWeb(proc.stdout) as ReadableStream<Uint8Array>
   const stream = acp.ndJsonStream(input, output)
   const connection = new acp.ClientSideConnection(() => client, stream)
 
-  // Initialize ACP
-  process.stderr.write(`wecom acp-bridge [${userId}]: initializing ACP connection...\n`)
+  process.stderr.write(`wecom acp-bridge [${key}]: initializing ACP connection...\n`)
   const initResult = await connection.initialize({
     protocolVersion: acp.PROTOCOL_VERSION,
     clientInfo: {
@@ -661,16 +661,17 @@ async function createSession(userId: string, frame: WsFrame): Promise<UserSessio
       },
     },
   })
-  process.stderr.write(`wecom acp-bridge [${userId}]: ACP initialized (protocol v${initResult.protocolVersion})\n`)
+  process.stderr.write(`wecom acp-bridge [${key}]: ACP initialized (protocol v${initResult.protocolVersion})\n`)
 
-  // Create session
   const sessionResult = await connection.newSession({
-    cwd: getUserCwd(userId),
+    cwd: getUserCwd(botName, userId),
     mcpServers: [],
   })
-  process.stderr.write(`wecom acp-bridge [${userId}]: session created (sessionId=${sessionResult.sessionId})\n`)
+  process.stderr.write(`wecom acp-bridge [${key}]: session created (sessionId=${sessionResult.sessionId})\n`)
 
   const session: UserSession = {
+    key,
+    botName,
     userId,
     frame,
     client,
@@ -682,14 +683,13 @@ async function createSession(userId: string, frame: WsFrame): Promise<UserSessio
     lastActivity: Date.now(),
   }
 
-  // Clean up on process exit
   proc.on('exit', (code, signal) => {
-    process.stderr.write(`wecom acp-bridge [${userId}]: agent exited code=${code} signal=${signal}\n`)
-    const s = userSessions.get(userId)
-    if (s?.process === proc) userSessions.delete(userId)
+    process.stderr.write(`wecom acp-bridge [${key}]: agent exited code=${code} signal=${signal}\n`)
+    const s = userSessions.get(key)
+    if (s?.process === proc) userSessions.delete(key)
   })
 
-  userSessions.set(userId, session)
+  userSessions.set(key, session)
   return session
 }
 
@@ -698,21 +698,17 @@ async function processQueue(session: UserSession): Promise<void> {
     while (session.queue.length > 0 && !shuttingDown) {
       const pending = session.queue.shift()!
 
-      // Update frame for the new message
       session.frame = pending.frame
-
-      // Reset chunks for the new turn
+      session.botName = pending.botName
       session.client.flush()
 
       try {
-        // Send ACP prompt
-        process.stderr.write(`wecom acp-bridge [${session.userId}]: sending prompt to agent...\n`)
+        process.stderr.write(`wecom acp-bridge [${session.key}]: sending prompt to agent...\n`)
         const result = await session.connection.prompt({
           sessionId: session.sessionId,
           prompt: pending.prompt,
         })
 
-        // Collect accumulated text
         let replyText = session.client.flush()
 
         if (result.stopReason === 'cancelled') {
@@ -721,43 +717,48 @@ async function processQueue(session: UserSession): Promise<void> {
           replyText += '\n[agent refused to continue]'
         }
 
-        process.stderr.write(`wecom acp-bridge [${session.userId}]: agent done (${result.stopReason}), reply ${replyText.length} chars\n`)
+        process.stderr.write(`wecom acp-bridge [${session.key}]: agent done (${result.stopReason}), reply ${replyText.length} chars\n`)
 
-        // Send reply back to WeCom
         if (replyText.trim()) {
-          const plainText = markdownToPlaintext(replyText)
-          const access = loadAccess()
-          const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-          const chunks = chunk(plainText, limit)
-          const streamId = generateReqId('stream')
+          const wsClient = botManager.getBot(pending.botName)
+          if (wsClient) {
+            const plainText = markdownToPlaintext(replyText)
+            const access = loadAccess()
+            const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+            const chunks = chunk(plainText, limit)
+            const streamId = generateReqId('stream')
 
-          for (let i = 0; i < chunks.length; i++) {
-            const isLast = i === chunks.length - 1
-            if (access.humanDelay && chunks.length > 1) {
-              await Bun.sleep(Math.min(chunks[i].length * 50, 3000))
+            for (let i = 0; i < chunks.length; i++) {
+              const isLast = i === chunks.length - 1
+              if (access.humanDelay && chunks.length > 1) {
+                await Bun.sleep(Math.min(chunks[i].length * 50, 3000))
+              }
+              await wsClient.replyStream(pending.frame, streamId, chunks[i], isLast)
             }
-            await wsClient.replyStream(pending.frame, streamId, chunks[i], isLast)
+          } else {
+            process.stderr.write(`wecom acp-bridge [${session.key}]: bot "${pending.botName}" not found for reply\n`)
           }
         }
       } catch (err) {
-        process.stderr.write(`wecom acp-bridge [${session.userId}]: agent prompt error: ${String(err)}\n`)
+        process.stderr.write(`wecom acp-bridge [${session.key}]: agent prompt error: ${String(err)}\n`)
 
-        // Check if agent died
         if (session.process.killed || session.process.exitCode !== null) {
-          process.stderr.write(`wecom acp-bridge [${session.userId}]: agent process died, removing session\n`)
-          userSessions.delete(session.userId)
+          process.stderr.write(`wecom acp-bridge [${session.key}]: agent process died, removing session\n`)
+          userSessions.delete(session.key)
           return
         }
 
-        // Send error message to user
         try {
-          const streamId = generateReqId('stream')
-          await wsClient.replyStream(
-            pending.frame,
-            streamId,
-            `⚠️ Agent error: ${String(err)}`,
-            true,
-          )
+          const wsClient = botManager.getBot(pending.botName)
+          if (wsClient) {
+            const streamId = generateReqId('stream')
+            await wsClient.replyStream(
+              pending.frame,
+              streamId,
+              `⚠️ Agent error: ${String(err)}`,
+              true,
+            )
+          }
         } catch {
           // best effort
         }
@@ -768,40 +769,42 @@ async function processQueue(session: UserSession): Promise<void> {
   }
 }
 
-async function enqueueMessage(userId: string, promptBlocks: acp.ContentBlock[], frame: WsFrame): Promise<void> {
-  let session = userSessions.get(userId)
+async function enqueueMessage(botName: string, userId: string, promptBlocks: acp.ContentBlock[], frame: WsFrame): Promise<void> {
+  const key = sessionKey(botName, userId)
+  let session = userSessions.get(key)
 
   if (!session || session.process.killed || session.process.exitCode !== null) {
-    // Need a new session
-    if (userSessions.has(userId)) userSessions.delete(userId)
+    if (userSessions.has(key)) userSessions.delete(key)
     if (userSessions.size >= MAX_CONCURRENT_USERS) {
       evictOldestSession()
     }
-    session = await createSession(userId, frame)
+    session = await createSession(botName, userId, frame)
   }
 
-  // Always update frame to the latest
   session.frame = frame
+  session.botName = botName
   session.lastActivity = Date.now()
-  session.queue.push({ prompt: promptBlocks, frame })
+  session.queue.push({ prompt: promptBlocks, frame, botName })
 
   if (!session.processing) {
     session.processing = true
     processQueue(session).catch((err) => {
-      process.stderr.write(`wecom acp-bridge [${userId}]: queue processing error: ${String(err)}\n`)
+      process.stderr.write(`wecom acp-bridge [${key}]: queue processing error: ${String(err)}\n`)
     })
   }
 }
 
 // --- Inbound message handler ---
 
-async function handleInbound(frame: WsFrame): Promise<void> {
+async function handleInbound(botName: string, frame: WsFrame): Promise<void> {
   const body = frame.body as any
   const userId = body.from?.userid
   if (!userId) return
 
-  // Store frame for reply context
-  contextMap.set(userId, { frame, ts: Date.now() })
+  const key = sessionKey(botName, userId)
+
+  // Store frame with botName for reply context
+  contextMap.set(key, { frame, ts: Date.now(), botName, userId })
   debouncedPersist()
 
   const result = gate(userId)
@@ -809,78 +812,88 @@ async function handleInbound(frame: WsFrame): Promise<void> {
   if (result.action === 'drop') return
 
   if (result.action === 'pair') {
-    const streamId = generateReqId('stream')
-    const lead = result.isResend ? '仍在等待配对' : '需要配对验证'
-    await wsClient.replyStream(frame, streamId, `${lead} — 在 Claude Code 终端运行：\n\n/wecom:access pair ${result.code}`, true).catch(() => {})
+    const wsClient = botManager.getBot(botName)
+    if (wsClient) {
+      const streamId = generateReqId('stream')
+      const lead = result.isResend ? '仍在等待配对' : '需要配对验证'
+      await wsClient.replyStream(frame, streamId, `${lead} — 在 Claude Code 终端运行：\n\n/wecom:access pair ${result.code}`, true).catch(() => {})
+    }
     return
   }
 
-  // Message approved
   knownUsers.add(userId)
 
-  // Handle commands
   const cmdText = body.msgtype === 'text' && body.text?.content ? body.text.content.trim() : ''
 
   if (cmdText === '/toggle-debug') {
     setDebugMode(!isDebugMode())
-    const streamId = generateReqId('stream')
-    await wsClient.replyStream(frame, streamId, `Debug 模式已${isDebugMode() ? '开启' : '关闭'}`, true).catch(() => {})
+    const wsClient = botManager.getBot(botName)
+    if (wsClient) {
+      const streamId = generateReqId('stream')
+      await wsClient.replyStream(frame, streamId, `Debug 模式已${isDebugMode() ? '开启' : '关闭'}`, true).catch(() => {})
+    }
     return
   }
 
   if (cmdText.startsWith('/echo ')) {
-    const streamId = generateReqId('stream')
-    await wsClient.replyStream(frame, streamId, `${cmdText.slice(6)}\n\n⏱ 延迟: ${Date.now() - (body.create_time ? body.create_time * 1000 : Date.now())}ms`, true).catch(() => {})
+    const wsClient = botManager.getBot(botName)
+    if (wsClient) {
+      const streamId = generateReqId('stream')
+      await wsClient.replyStream(frame, streamId, `${cmdText.slice(6)}\n\n⏱ 延迟: ${Date.now() - (body.create_time ? body.create_time * 1000 : Date.now())}ms`, true).catch(() => {})
+    }
     return
   }
 
   if (cmdText.startsWith('/cwd')) {
     const newCwd = cmdText.slice(4).trim()
+    const wsClient = botManager.getBot(botName)
     if (!newCwd) {
-      // Show current cwd
-      const currentCwd = getUserCwd(userId)
-      const streamId = generateReqId('stream')
-      await wsClient.replyStream(frame, streamId, `当前工作目录: ${currentCwd}`, true).catch(() => {})
+      const currentCwd = getUserCwd(botName, userId)
+      if (wsClient) {
+        const streamId = generateReqId('stream')
+        await wsClient.replyStream(frame, streamId, `当前工作目录: ${currentCwd}`, true).catch(() => {})
+      }
       return
     }
-    // Validate path exists
     try {
       const stat = statSync(newCwd)
       if (!stat.isDirectory()) {
-        const streamId = generateReqId('stream')
-        await wsClient.replyStream(frame, streamId, `❌ 路径不是目录: ${newCwd}`, true).catch(() => {})
+        if (wsClient) {
+          const streamId = generateReqId('stream')
+          await wsClient.replyStream(frame, streamId, `❌ 路径不是目录: ${newCwd}`, true).catch(() => {})
+        }
         return
       }
     } catch {
-      const streamId = generateReqId('stream')
-      await wsClient.replyStream(frame, streamId, `❌ 目录不存在: ${newCwd}`, true).catch(() => {})
+      if (wsClient) {
+        const streamId = generateReqId('stream')
+        await wsClient.replyStream(frame, streamId, `❌ 目录不存在: ${newCwd}`, true).catch(() => {})
+      }
       return
     }
-    // Save per-user cwd
-    userCwdMap.set(userId, newCwd)
+    userCwdMap.set(key, newCwd)
     persistUserCwd()
-    // Destroy current session, next message will create new one with new cwd
-    const existingSession = userSessions.get(userId)
+    const existingSession = userSessions.get(key)
     if (existingSession) {
       if (!existingSession.process.killed) existingSession.process.kill('SIGTERM')
-      userSessions.delete(userId)
+      userSessions.delete(key)
     }
-    const streamId = generateReqId('stream')
-    await wsClient.replyStream(frame, streamId, `✅ 工作目录已切换: ${newCwd}\nAgent 会话已重置，下条消息将在新目录启动`, true).catch(() => {})
+    if (wsClient) {
+      const streamId = generateReqId('stream')
+      await wsClient.replyStream(frame, streamId, `✅ 工作目录已切换: ${newCwd}\nAgent 会话已重置，下条消息将在新目录启动`, true).catch(() => {})
+    }
     return
   }
 
-  // Extract text and download any media attachments inline
-  const text = extractMessageContent(frame)
+  const text = extractMessageContent(frame, botName)
 
-  // Download any pending attachments and include file paths in prompt
   let promptText = text
   const attachmentIds = [...text.matchAll(/attachment_id=([a-z_0-9]+)/g)].map(m => m[1])
   if (attachmentIds.length > 0) {
     const downloadedPaths: string[] = []
     for (const aid of attachmentIds) {
       try {
-        const localPath = await downloadAttachment(aid)
+        const localPath = await downloadAttachment(aid, botName)
         if (localPath) downloadedPaths.push(localPath)
       } catch (err) {
         process.stderr.write(`wecom acp-bridge: attachment download failed (${aid}): ${err}\n`)
@@ -891,9 +904,8 @@ async function handleInbound(frame: WsFrame): Promise<void> {
     }
   }
 
-  // Send to ACP agent via session queue
   const promptBlocks: acp.ContentBlock[] = [{ type: 'text', text: promptText }]
-  await enqueueMessage(userId, promptBlocks, frame)
+  await enqueueMessage(botName, userId, promptBlocks, frame)
 }
 
 // --- Start ---
@@ -901,30 +913,32 @@ async function handleInbound(frame: WsFrame): Promise<void> {
 let shuttingDown = false
 
 process.stderr.write(`wecom acp-bridge: started (ACP mode, agent=${AGENT_COMMAND} ${AGENT_ARGS.join(' ')}, default cwd=${AGENT_CWD})\n`)
-process.stderr.write('wecom acp-bridge: connecting to WeCom...\n')
+process.stderr.write('wecom acp-bridge: connecting all bots to WeCom...\n')
 
-wsClient.connect()
+botManager.connectAll()
+botManager.printStatus()
 
-// --- WebSocket event handlers ---
+// --- Per-bot event handlers ---
 
-wsClient.on('authenticated', () => {
-  process.stderr.write('wecom acp-bridge: WebSocket authenticated\n')
-})
-
-wsClient.on('disconnected', (reason) => {
-  process.stderr.write(`wecom acp-bridge: disconnected (${reason})\n`)
-})
-
-wsClient.on('error', (error) => {
-  process.stderr.write(`wecom acp-bridge: error - ${error.message}\n`)
-})
-
-// Handle all messages
-wsClient.on('message', (frame: WsFrame) => {
-  handleInbound(frame).catch((err) => {
-    process.stderr.write(`wecom acp-bridge: message handler error: ${err}\n`)
+for (const botName of botManager.botNames) {
+  botManager.on(`${botName}.authenticated`, () => {
+    process.stderr.write(`wecom acp-bridge: bot "${botName}" authenticated\n`)
   })
-})
+
+  botManager.on(`${botName}.disconnected`, (reason: string) => {
+    process.stderr.write(`wecom acp-bridge: bot "${botName}" disconnected (${reason})\n`)
+  })
+
+  botManager.on(`${botName}.error`, (error: Error) => {
+    process.stderr.write(`wecom acp-bridge: bot "${botName}" error - ${error.message}\n`)
+  })
+
+  botManager.on(`${botName}.message`, (frame: WsFrame) => {
+    handleInbound(botName, frame).catch((err) => {
+      process.stderr.write(`wecom acp-bridge: message handler error: ${err}\n`)
+    })
+  })
+}
 
 // --- Graceful shutdown ---
 
@@ -933,19 +947,16 @@ function shutdown(reason: string): void {
   shuttingDown = true
   process.stderr.write(`wecom acp-bridge: shutting down (${reason})\n`)
 
-  // Persist any pending context tokens
   if (persistTimer) {
     clearTimeout(persistTimer)
     persistTimer = null
     persistContextTokens()
   }
 
-  // Kill all agent sessions
-  for (const [uid, s] of userSessions) {
-    process.stderr.write(`wecom acp-bridge: stopping session for ${uid}\n`)
+  for (const [key, s] of userSessions) {
+    process.stderr.write(`wecom acp-bridge: stopping session for ${key}\n`)
     if (!s.process.killed) {
       s.process.kill('SIGTERM')
-      // Force kill after 5s if still alive
       setTimeout(() => {
         if (!s.process.killed) s.process.kill('SIGKILL')
       }, 5_000).unref()
@@ -953,11 +964,9 @@ function shutdown(reason: string): void {
   }
   userSessions.clear()
 
-  // Clear idle cleanup timer
   clearInterval(cleanupTimer)
 
-  // Disconnect WebSocket
-  wsClient.disconnect()
+  botManager.disconnectAll()
 
   const forceTimer = setTimeout(() => {
     process.stderr.write('wecom acp-bridge: force exit after timeout\n')
@@ -965,7 +974,6 @@ function shutdown(reason: string): void {
   }, 2000)
   forceTimer.unref()
 
-  // Exit after a short delay for pending I/O
   setTimeout(() => {
     clearTimeout(forceTimer)
     process.exit(0)
@@ -980,6 +988,6 @@ process.on('unhandledRejection', (err) => {
   process.stderr.write(`wecom acp-bridge: unhandled rejection: ${err}\n`)
 })
 process.on('uncaughtException', (err) => {
-  process.stderr.write(`wecom acp-bridge: uncaught exception: ${err}\n`)
+  process.stderr.write(`wecom acp-bridge: unhandled exception: ${err}\n`)
   shutdown('uncaughtException')
 })
